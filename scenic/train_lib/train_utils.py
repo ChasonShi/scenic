@@ -486,7 +486,7 @@ def sync_model_state_across_replicas(train_state: TrainState) -> TrainState:
   """
   # TODO(dehghani): We simply do "mean" here and this doesn't work with
   #   statistics like variance. (check the discussion in Flax for fixing this).
-  if jax.tree_leaves(train_state.model_state):
+  if jax.tree_util.tree_leaves(train_state.model_state):
     # If the model_state is not empty.
     new_model_state = train_state.model_state.copy(
         {'batch_stats': pmap_mean(train_state.model_state['batch_stats'])})
@@ -629,7 +629,11 @@ def normalize_metrics_summary(metrics_summary: Dict[str, Tuple[float, int]],
   for key, val in metrics_summary.items():
     normalized_metrics_summary[key] = val[0] / (val[1] + 1e-9)
     if np.isnan(normalized_metrics_summary[key]):
-      raise TrainingDivergedError('NaN detected in {}'.format(f'{split}_{key}'))
+      msg = f'NaN detected in {split}_{key} (Unnormalized values: {val})'
+      if split == 'train':
+        raise TrainingDivergedError(msg)
+      else:
+        logging.error('WARNING: Split %s %s', split, msg)
 
   return normalized_metrics_summary
 
@@ -832,6 +836,107 @@ def log_train_summary(step: int,
   return train_metrics_summary
 
 
+def accumulate_gradients(
+    compute_gradient_fn: Callable[
+        [TrainState, Dict[str, jnp.ndarray], jnp.ndarray], Tuple[Any,
+                                                                 jnp.ndarray]],
+    metrics_fn: Callable[[jnp.ndarray, Dict[str, jnp.ndarray]],
+                         Dict[str, Tuple[float, int]]], train_state: TrainState,
+    batch: Dict[str, jnp.ndarray], dropout_rng: jnp.ndarray,
+    accum_steps: Optional[int]
+) -> Tuple[Optional[jnp.ndarray], jnp.ndarray, jnp.ndarray, Dict[str, Tuple[
+    float, int]]]:
+  """Accumulate gradients over multiple steps.
+
+  This enables training with larger effective batch sizes.
+  Note that currently, gradient accumulation is not supported when the
+  `model_state` is used, e.g., for models that have batch normalization and
+  store batch statistics in the `model_state`.
+
+  Note that if `accum_steps` <= 1 or is None, then the gradient of a single step
+  is simply returned.
+
+  Args:
+    compute_gradient_fn: Gradient function, e.g., `jax.value_and_grad(
+      training_loss_fn, ...).
+    metrics_fn: A metrics function that given logits and batch of data,
+      calculates the metrics.
+    train_state: An instance of TrainState that has the parameters of the model,
+      state of the model, etc.
+    batch: A single batch of data. The buffer of this argument can be donated to
+      the computation.
+    dropout_rng: JAX rng key used for dropout.
+    accum_steps: Number of accumulating steps (number of micro batches). When
+      set to None or =<1, no accumulation is done.
+
+  Returns:
+    A tuple of model_state (e.g., batch statistics),
+      computed gradients, training loss, and calculated metrics.
+  """
+  params = train_state.params
+  if accum_steps and accum_steps > 1:
+    batch_size = next(iter(batch.values())).shape[0]
+    microbatch_size = batch_size // accum_steps
+    if batch_size % accum_steps != 0:
+      raise ValueError(
+          f'Bad accum_steps {accum_steps} for batch size {batch_size}')
+    logging.info('Using microbatches: %d microbatches, %d size', accum_steps,
+                 microbatch_size)
+
+    def get_microbatch(batch: Dict[str, jnp.ndarray],
+                       idx: int) -> Dict[str, jnp.ndarray]:
+      """Fetch microbatch slice from the given batch."""
+      return jax.tree_map(
+          lambda x: x.reshape((-1, microbatch_size) + x.shape[1:])[idx], batch)
+
+    def per_microbatch_compute_gradient_fn(
+        loop_cnt: int, loop_state: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray,
+                                         Dict[str, Tuple[float, int]]]
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, Tuple[float, int]],
+               jnp.ndarray]:
+      dropout_rng, grad_accum, train_loss_acc, metrics_acc = loop_state
+      dropout_rng, sub_dropout_rng = jax.random.split(dropout_rng)
+      mbatch = get_microbatch(batch, loop_cnt)
+      (train_loss,
+       (_, mlogits)), grad = compute_gradient_fn(params, mbatch,
+                                                 sub_dropout_rng)
+      metrics = metrics_fn(mlogits, mbatch)
+      # Accumulate gradients and metrics.
+      grad = jax.tree_util.tree_map(jnp.add, grad_accum, grad)
+      metrics = jax.tree_util.tree_map(jnp.add, metrics, metrics_acc)
+      train_loss = jax.tree_util.tree_map(jnp.add, train_loss, train_loss_acc)
+      return dropout_rng, grad, train_loss, metrics
+
+    # Initialize gradient accumulation loop state.
+    dropout_rng, sub_dropout_rng = jax.random.split(dropout_rng)
+    init_mbatch = get_microbatch(batch, 0)
+    (init_train_loss,
+     (model_state,
+      init_logits)), grad_init = compute_gradient_fn(params, init_mbatch,
+                                                     sub_dropout_rng)
+    if jax.tree_leaves(model_state):
+      # If the model_state is not empty.
+      raise ValueError('Gradient accumulation is not supported when the '
+                       'model_state is in used (e.g. models w/ batch norm).')
+
+    metrics_init = metrics_fn(init_logits, init_mbatch)
+    del init_logits, init_mbatch
+
+    # Run gradient accumulation loop.
+    loop_init = (dropout_rng, grad_init, init_train_loss, metrics_init)
+    _, grad_acc, train_loss, metrics_acc = jax.lax.fori_loop(
+        1, accum_steps, per_microbatch_compute_gradient_fn, loop_init)
+    grad_acc = jax.tree_util.tree_map(lambda x: x / accum_steps, grad_acc)
+    train_loss = jax.tree_util.tree_map(lambda x: x / accum_steps, train_loss)
+    return model_state, grad_acc, train_loss, metrics_acc
+  else:
+    (train_loss, (model_state,
+                  logits)), grad = compute_gradient_fn(params, batch,
+                                                       dropout_rng)
+    metrics = metrics_fn(logits, batch)
+    return model_state, grad, train_loss, metrics
+
+
 class Chrono:
   """Measures time and reports progress.
 
@@ -851,7 +956,7 @@ class Chrono:
   """
 
   def __init__(self, example_type: str = 'img', warmup: int = 2):
-    self.program_start_time = time.time()
+    self.program_start_time = time.monotonic()
     self.train_start_time = None
     self.train_start_step = None  # When we started timing (after warmup)
 
@@ -892,7 +997,8 @@ class Chrono:
       h, m = divmod(m, 60)
       return f'{h:.0f}h{m:.0f}m'  # Seconds intentionally omitted.
 
-    now = time.time()
+    now = time.monotonic()
+    summary.update({'uptime': now - self.program_start_time})
     # We always count examples, regardless of the timing-related warmup that
     # happens a few lines below.
     ds = step - self.prev_step  # Steps between ticks
@@ -948,7 +1054,7 @@ class Chrono:
     steps_todo = self.total_steps - step
     self.note = f'Steps:{step}/{self.total_steps} [{step/self.total_steps:.1%}]'
     self.note += f'\nWalltime:{hms(self.accum_program_time)}'
-    self.note += f' ({hms(self.accum_pause_time)} eval)'
+    self.note += f' ({hms(self.accum_pause_time)} Not-train)'
     self.note += f'\nETA:{hms(dt / steps_timed * steps_todo)}'
     self.note += f'\nTotal train time:{hms(dt / steps_timed * self.total_steps)}'
     write_note(self.note)
@@ -959,11 +1065,11 @@ class Chrono:
   def pause(self, wait_for=()):
     assert self.pause_start is None, "Don't pause twice."
     jax.block_until_ready(wait_for)
-    self.pause_start = time.time()
+    self.pause_start = time.monotonic()
 
   def resume(self):
     assert self.pause_start is not None, 'Cannot resume without pausing first.'
-    self.paused_time += time.time() - self.pause_start
+    self.paused_time += time.monotonic() - self.pause_start
     self.pause_start = None
 
   def save(self):
@@ -979,3 +1085,11 @@ class Chrono:
     self.accum_train_time = ckpt.get('accum_train_time', 0.0)
     self.accum_pause_time = ckpt.get('accum_pause_time', 0.0)
     self.accum_examples_seen = ckpt.get('accum_examples_seen', 0)
+
+
+def barrier_across_hosts():
+  """Ensure all hosts stay up until the end, otherwise the program may hang."""
+  if jax.process_count() > 1:
+    x = jnp.ones([jax.local_device_count()])
+    x = jax.device_get(jax.pmap(lambda x: jax.lax.psum(x, 'i'), 'i')(x))
+    assert x[0] == jax.device_count()

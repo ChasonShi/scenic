@@ -1,4 +1,4 @@
-"""Training script with transfer learning utilities."""
+"""Training script."""
 
 import functools
 from typing import Any, Callable, Dict, Iterator, Tuple, Optional, Type
@@ -129,10 +129,10 @@ def train_step(
   new_params = optax.apply_updates(train_state.params, updates)
 
   training_logs['l2_grads'] = jnp.sqrt(
-      sum([jnp.vdot(g, g) for g in jax.tree_leaves(grad)]))
-  ps = jax.tree_leaves(new_params)
+      sum([jnp.vdot(g, g) for g in jax.tree_util.tree_leaves(grad)]))
+  ps = jax.tree_util.tree_leaves(new_params)
   training_logs['l2_params'] = jnp.sqrt(sum([jnp.vdot(p, p) for p in ps]))
-  us = jax.tree_leaves(updates)
+  us = jax.tree_util.tree_leaves(updates)
   training_logs['l2_updates'] = jnp.sqrt(sum([jnp.vdot(u, u) for u in us]))
   training_logs['learning_rate'] = lr_fn(train_state.global_step)
 
@@ -543,7 +543,9 @@ def train(
     if lead_host:
       platform.work_unit().set_notes(note)
 
-  hooks = [report_progress]
+  hooks = []
+  if lead_host:
+    hooks.append(report_progress)
   if config.get('xprof', True) and lead_host:
     hooks.append(periodic_actions.Profile(num_profile_steps=5, logdir=workdir))
 
@@ -666,6 +668,6 @@ def train(
         chrono.resume()  # Un-pause now.
 
   # Wait until computations are done before exiting.
-  jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
+  train_utils.barrier_across_hosts()
   # Return the train and eval summary after last step for regression testing.
   return train_state, train_summary, eval_summary

@@ -34,6 +34,7 @@ from scenic.model_lib.layers import nn_layers
 # TODO(mrit): Upstream this to jax.nn.initializers
 # Inputs are PRNGKey, input shape and dtype.
 Initializer = Callable[[jnp.ndarray, Iterable[int], jnp.dtype], jnp.ndarray]
+Shape = Sequence[int]
 
 
 def _attention_dropout(attn_weights: jnp.ndarray,
@@ -264,6 +265,8 @@ class MultiHeadAttention(nn.Module):
     broadcast_dropout: Use a broadcasted dropout along batch dims.
     kernel_init: Initializer for the kernel of the Dense layers.
     bias_init: Initializer for the bias of the Dense layers.
+    out_kernel_init: Initializer for the kernel of the output Dense layers. If
+      None, kernel_init will be used.
     use_bias: Whether pointwise QKV dense transforms use bias.
     precision: Numerical precision of the computation see `jax.lax.Precision`
       for details.
@@ -280,6 +283,7 @@ class MultiHeadAttention(nn.Module):
   broadcast_dropout: bool = False
   kernel_init: Initializer = nn.linear.default_kernel_init
   bias_init: Initializer = nn.initializers.zeros
+  out_kernel_init: Optional[Initializer] = None
   use_bias: bool = True
   attention_fn: Callable[..., jnp.ndarray] = dot_product_attention
   precision: Optional[jax.lax.Precision] = None
@@ -377,10 +381,12 @@ class MultiHeadAttention(nn.Module):
     # pylint: enable=too-many-function-args
 
     # Back to the original inputs dimensions.
+    out_kernel_init = (self.out_kernel_init if self.out_kernel_init is not None
+                       else self.kernel_init)
     out = nn.DenseGeneral(
         features=features,
         axis=(-2, -1),
-        kernel_init=self.kernel_init,
+        kernel_init=out_kernel_init,
         bias_init=self.bias_init,
         use_bias=True,
         dtype=self.dtype,
@@ -579,6 +585,55 @@ class Add2DPositionEmbedding(nn.Module):
     return inputs + pos
 
 
+def get_fixed_sincos_position_embedding(x_shape: Shape,
+                                        temperature: float = 10_000,
+                                        dtype: jnp.dtype = jnp.float32):
+  """Provides a fixed position encoding for 2D and 3D coordinates.
+
+  The embedding follows the initialisation method used in multiple papers such
+  as "Attention is All You Need", https://arxiv.org/abs/1706.03762 and
+  "Better plain ViT baselines for ImageNet-1k", https://arxiv.org/abs/2205.01580
+
+  Arguments:
+    x_shape: the shape of the input for which a position embedding is needed.
+    temperature: Temperature parameter.
+    dtype: dtype of the position encoding.
+  Returns:
+    Matrix of position embeddings, has shape [1, ...], where ... = x_shape[1:].
+  """
+  assert len(x_shape) in (4, 5), f'Unsupported input shape: {x_shape}'
+  num_parts = 4 if len(x_shape) == 4 else 6
+  channels = x_shape[-1]
+  assert channels % num_parts == 0, f'Channels must be multiple of {num_parts}'
+  omega = jnp.arange(
+      channels // num_parts, dtype=jnp.float32) / (channels / num_parts)
+  omega = 1. / (temperature**omega)
+
+  if len(x_shape) == 4:  # 2D input.
+    _, h, w, _ = x_shape
+    y, x = jnp.mgrid[:h, :w]
+    y = jnp.einsum('m,d->md', y.flatten(), omega)
+    x = jnp.einsum('m,d->md', x.flatten(), omega)
+    p = [jnp.sin(x), jnp.cos(x), jnp.sin(y), jnp.cos(y)]
+    shape = (1, h, w, channels)
+  elif len(x_shape) == 5:  # 3D input.
+    _, t, h, w, _ = x_shape
+    z, y, x = jnp.mgrid[:t, :h, :w]
+    z = jnp.einsum('m,d->md', z.flatten(), omega)
+    y = jnp.einsum('m,d->md', y.flatten(), omega)
+    x = jnp.einsum('m,d->md', x.flatten(), omega)
+    p = [jnp.sin(z), jnp.cos(z),
+         jnp.sin(x), jnp.cos(x),
+         jnp.sin(y), jnp.cos(y)]
+    shape = (1, t, h, w, channels)
+  else:  # Should never reach there because of assert at beginning.
+    raise ValueError(f'Unsupported input shape: {x_shape}')
+
+  assert (shape[0] == 1) and (shape[1:] == x_shape[1:])
+  pe = jnp.concatenate(p, axis=1)
+  return jnp.asarray(pe, dtype).reshape(*shape)
+
+
 class AddFixedSinCosPositionEmbedding(nn.Module):
   """Provides a fixed position encoding for 2D and 3D coordinates.
 
@@ -590,7 +645,7 @@ class AddFixedSinCosPositionEmbedding(nn.Module):
     temperature: Temperature parameter.
     dtype: dtype of the position encoding.
   """
-  temperature: int = 10_000
+  temperature: float = 10_000
   dtype: jnp.dtype = jnp.float32
 
   @nn.compact
@@ -603,37 +658,8 @@ class AddFixedSinCosPositionEmbedding(nn.Module):
     Returns:
       inputs with position encodings added to them.
     """
-    assert inputs.ndim in (4, 5), f'Unsupported input shape: {inputs.shape}'
-    num_parts = 4 if inputs.ndim == 4 else 6
-    channels = inputs.shape[-1]
-    assert channels % num_parts == 0, f'Channels must be multiple of {num_parts}'
-    omega = jnp.arange(
-        channels // num_parts, dtype=jnp.float32) / (channels / num_parts)
-    omega = 1. / (self.temperature**omega)
-
-    if inputs.ndim == 4:  # 2D input.
-      _, h, w, _ = inputs.shape
-      y, x = jnp.mgrid[:h, :w]
-      y = jnp.einsum('m,d->md', y.flatten(), omega)
-      x = jnp.einsum('m,d->md', x.flatten(), omega)
-      p = [jnp.sin(x), jnp.cos(x), jnp.sin(y), jnp.cos(y)]
-      shape = (1, h, w, channels)
-    elif inputs.ndim == 5:  # 3D input.
-      _, t, h, w, _ = inputs.shape
-      z, y, x = jnp.mgrid[:t, :h, :w]
-      z = jnp.einsum('m,d->md', z.flatten(), omega)
-      y = jnp.einsum('m,d->md', y.flatten(), omega)
-      x = jnp.einsum('m,d->md', x.flatten(), omega)
-      p = [jnp.sin(z), jnp.cos(z),
-           jnp.sin(x), jnp.cos(x),
-           jnp.sin(y), jnp.cos(y)]
-      shape = (1, t, h, w, channels)
-    else:  # Should never reach there because of assert at beginning.
-      raise ValueError(f'Unsupported input shape: {inputs.shape}')
-
-    pe = jnp.concatenate(p, axis=1)
-    pe_reshaped = jnp.asarray(pe, self.dtype).reshape(*shape)
-    return inputs + pe_reshaped
+    return inputs + get_fixed_sincos_position_embedding(
+        inputs.shape, self.temperature, self.dtype)
 
 
 class RelativeAttentionBias(nn.Module):

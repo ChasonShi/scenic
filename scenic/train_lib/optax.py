@@ -23,11 +23,28 @@ from typing import Any, Optional, Sequence, Tuple, Union, Callable, List
 
 from absl import logging
 import jax
+import jax.numpy as jnp
 import ml_collections
 import numpy as np
 import optax
 from scenic.train_lib import lr_schedules
 from scenic.train_lib import optimizers
+
+
+def find_states(opt_state, cls):
+  leaves = jax.tree_util.tree_leaves(
+      opt_state, is_leaf=lambda node: isinstance(node, cls))
+  return [leaf for leaf in leaves if isinstance(leaf, cls)]
+
+
+def get_step(opt_state):
+  """Returns `ScaleByScheduleState.count` from `opt_state` as an integer."""
+  counts = {
+      int(state.count)
+      for state in find_states(opt_state, optax.ScaleByScheduleState)
+  }
+  assert len(counts) == 1, f'Expected exactly 1 ScaleByScheduleState: {counts}'
+  return next(iter(counts))
 
 
 def _make_mask_trees(
@@ -120,8 +137,8 @@ def replace_frozen(schedule, pytree, replacement, log: Optional[str] = None):
 def make_schedule(
     schedule: Optional[ml_collections.ConfigDict] = None,
     get_learning_rate_fn: Callable[
-        [ml_collections.ConfigDict], optax.ScalarOrSchedule
-        ] = lr_schedules.get_learning_rate_fn,
+        [ml_collections.ConfigDict],
+        optax.ScalarOrSchedule] = lr_schedules.get_learning_rate_fn,
 ) -> List[Tuple[str, str, Tuple[optax.ScalarOrSchedule, float]]]:
   """Creates a schedule dictionary compatible with the `make` function."""
   # Global schedule. No schedule means frozen.
@@ -134,12 +151,12 @@ def make_schedule(
   def create_schedule(lr_configs):
     fn = get_learning_rate_fn(
         ml_collections.ConfigDict({'lr_configs': lr_configs}))
-
     # Base LR is used for decoupling WD from LR schedules.
     base_lr = 1.0
     if lr_configs is not None:
       base_lr = lr_configs.get('base_learning_rate', 1.0)
     return fn, base_lr
+
   schedule = [(re, name, create_schedule(lr_configs))
               for re, name, lr_configs in schedule]
   return schedule
@@ -161,15 +178,10 @@ def make(config: ml_collections.ConfigDict,
   masks, scheds = _make_mask_trees(params, schedule, log='schedule')
   frozen_mask, masks, scheds = _split_frozen(masks, scheds)
   not_frozen_mask = jax.tree_util.tree_map(operator.not_, frozen_mask)
-  acc_steps = config.get('accumulate_steps', 1)
   schedule_fns, schedule_base_lr = zip(
       *[fn_base for _, fn_base in (scheds or [])])
-  def wrap_schedule(fn):
-    def wrapper(step):
-      return fn(step * acc_steps)
-    return wrapper
   schedule_txs = [
-      optax.masked(optax.scale_by_schedule(wrap_schedule(schedule_fn)), mask)
+      optax.masked(optax.scale_by_schedule(schedule_fn), mask)
       for schedule_fn, mask in zip(schedule_fns, masks)
   ] + [
       # Removes weight decay updates. Note that weight decay already has an
@@ -211,7 +223,7 @@ def make(config: ml_collections.ConfigDict,
     grad_clip_norm_tx = []
 
   # Optimizer updates.
-  tx_func = getattr(optax, config.optax_name)
+  tx_func = operator.attrgetter(config.optax_name)(optax)
   opt_txs = [optax.masked(
       tx_func(**config.get('optax_configs', {})), not_frozen_mask)]
 
@@ -238,8 +250,8 @@ def make(config: ml_collections.ConfigDict,
         zip(mults, decay_masks), zip(masks, schedule_base_lr)):
       weight_decay_txs.append(
           optax.add_decayed_weights(
-              mult / base_lr,  # Decouple WD from LR.
-              jax.tree_map(lambda a, b: a and b, decay_mask, mask)))
+              mult / base_lr if base_lr else 0.0,  # Decouple WD from LR.
+              jax.tree_util.tree_map(lambda a, b: a and b, decay_mask, mask)))
   else:
     weight_decay_txs = []
 
@@ -250,8 +262,6 @@ def make(config: ml_collections.ConfigDict,
       *weight_decay_txs,
       *schedule_txs,
       optax.scale(-1.0))
-  if acc_steps > 1:
-    opt = optax.MultiSteps(opt, acc_steps, use_grad_mean=False)
   return opt, schedule_fns
 
 
@@ -276,3 +286,17 @@ def aggregate_gradients_pmean(
     return jax.lax.pmean(updates, axis_name=axis_name), None
 
   return optax.GradientTransformation(init_fn, update_fn)
+
+################# Scenic optimizers ##############################
+# This is following the BV codebase pattern for defining a custom optimizer.
+# A dummy object to allow for foo.bar access syntax, see
+# https://stackoverflow.com/a/19476841/2366315
+optax.scenic = type('', (), {})()
+
+
+def momentum_hp(momentum=0.9, dtype=jnp.bfloat16, nesterov=False):
+  """SGD-Momentum with half-precision accumulator."""
+  return optax.trace(decay=momentum, accumulator_dtype=dtype, nesterov=nesterov)
+
+
+optax.scenic.momentum_hp = momentum_hp  # pytype: disable=module-attr

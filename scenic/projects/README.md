@@ -5,6 +5,10 @@
 
 ## List of projects hosted in Scenic
 
+*   [AdaTape](adatape)
+
+    > AdaTape is an adaptive computation transformer with elastic input sequence.
+
 *   [AdversarialTraining](adversarialtraining)
 
     > Adversarial training is an implementation of modern forms of adversarial
@@ -18,12 +22,22 @@
     > classification that achieved state-of-the-art results.
     > Details can be found in the [paper](https://arxiv.org/abs/2103.15691).
 
+*   [Tasseo](tasseo)
+
+    > Tasseo is a project that uses transformer based models for aberration
+    > detection from chromosome karyotype images.
+
 *   [TokenLearner](token_learner)
 
     > TokenLearner proposes dynamic tokenization of images and videos for faster
     > and more accurate video/image processing tasks. More can be found in
     > the [paper](https://arxiv.org/abs/2106.11297).
 
+*   [Token Turing Machines](token_turing)
+
+    > Token Turing Machines are a sequential, autoregressive transformer
+    > architecture with external memory. More can be found in the
+    > [paper](https://arxiv.org/abs/2106.11297).
 
 *   [FastViT](fast_vit)
 
